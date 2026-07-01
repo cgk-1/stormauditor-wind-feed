@@ -86,7 +86,18 @@ def gust_slice(date_str, hh):
     if start is None:
         return None
     req = urllib.request.Request(f"{BASE}/{stem}", headers={"Range": f"bytes={start}-{end}"})
-    open("/tmp/_g.grib2", "wb").write(urllib.request.urlopen(req, timeout=120).read())
+    data = None
+    for attempt in range(4):
+        try:
+            data = urllib.request.urlopen(req, timeout=180).read()
+            if len(data) >= (end - start) if isinstance(end, int) else True:
+                break
+        except Exception:
+            data = None
+        import time as _t; _t.sleep(2 * (attempt + 1))
+    if not data:
+        return None
+    open("/tmp/_g.grib2", "wb").write(data)
     g = pygrib.open("/tmp/_g.grib2"); m = g[1]
     v = m.values.astype("float32")
     if "LATS" not in _GEOM:
@@ -147,13 +158,21 @@ def build_state(mph, lats, lons, geom):
 
 
 def rpc(base, anon, name, payload):
-    r = requests.post(f"{base}/rest/v1/rpc/{name}",
-                      headers={"apikey": anon, "Authorization": f"Bearer {anon}",
-                               "Content-Type": "application/json"},
-                      data=json.dumps(payload), timeout=90)
-    if r.status_code >= 300:
-        raise RuntimeError(f"{name} {r.status_code}: {r.text[:200]}")
-    return r
+    import time as _t
+    last = ""
+    for attempt in range(4):
+        try:
+            r = requests.post(f"{base}/rest/v1/rpc/{name}",
+                              headers={"apikey": anon, "Authorization": f"Bearer {anon}",
+                                       "Content-Type": "application/json"},
+                              data=json.dumps(payload), timeout=120)
+            if r.status_code < 300:
+                return r
+            last = f"{name} {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            last = f"{name} exception: {e}"
+        _t.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(last)
 
 
 def process_date(date_str, states, base, anon, secret, step):
@@ -190,7 +209,19 @@ def process_date(date_str, states, base, anon, secret, step):
 def main():
     raw = os.environ.get("INGEST_DATE") or \
         (dt.datetime.utcnow().date() - dt.timedelta(days=1)).strftime("%Y%m%d")
-    dates = [d.strip() for d in raw.split(",") if d.strip()]
+    # tokens may be single dates (YYYYMMDD) or inclusive ranges (YYYYMMDD:YYYYMMDD)
+    dates = []
+    for tok in [d.strip() for d in raw.split(",") if d.strip()]:
+        if ":" in tok:
+            a, b = tok.split(":")
+            d0 = dt.datetime.strptime(a, "%Y%m%d").date()
+            d1 = dt.datetime.strptime(b, "%Y%m%d").date()
+            cur = d0
+            while cur <= d1:
+                dates.append(cur.strftime("%Y%m%d"))
+                cur += dt.timedelta(days=1)
+        else:
+            dates.append(tok)
     step = int(os.environ.get("HOURS_STEP", "1"))
     base = os.environ["SUPABASE_URL"].rstrip("/")
     anon = os.environ["SUPABASE_ANON_KEY"]
