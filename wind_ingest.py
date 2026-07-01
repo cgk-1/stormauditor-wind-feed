@@ -115,7 +115,7 @@ def build_state(mph, lats, lons, geom):
     pts = np.column_stack([lons[m], lats[m]]); vals = mph[m]
     peak = float(np.nanmax(vals))
     if peak < POINT_FLOOR:
-        return [], [], round(peak, 0)
+        return [], [], int(round(peak))
 
     # resample Lambert -> regular grid for polygon bands
     gx = np.arange(minx, maxx, GRID_RES); gy = np.arange(miny, maxy, GRID_RES)
@@ -143,7 +143,7 @@ def build_state(mph, lats, lons, geom):
         if val >= POINT_FLOOR and pg.contains(Point(float(lon), float(lat))):
             points.append({"lon": round(float(lon), 3), "lat": round(float(lat), 3),
                            "v": int(round(float(val)))})
-    return feats, points, round(peak, 0)
+    return feats, points, int(round(peak))
 
 
 def rpc(base, anon, name, payload):
