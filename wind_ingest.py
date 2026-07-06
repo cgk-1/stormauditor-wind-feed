@@ -206,6 +206,7 @@ def process_date(date_str, states, base, anon, secret, step):
                      "p_points": points[i:i+4000], "p_append": i > 0})
             stored += 1
             print(f"  {date_iso}  {st:16s} peak {peak:.0f} mph, {len(feats)} band(s)")
+            import time as _t; _t.sleep(float(os.environ.get("STATE_PAUSE", "0.4")))
         except Exception as e:
             print(f"  [error] {date_iso} {st}: {e}")
     if stored == 0:
