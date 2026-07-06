@@ -191,12 +191,19 @@ def process_date(date_str, states, base, anon, secret, step):
             feats, points, peak = build_state(mph, lats, lons, geom)
             if not feats:
                 continue
-            rpc(base, anon, "ingest_wind_swath",
-                {"p_secret": secret, "p_state": st, "p_date": date_iso,
-                 "p_max_mph": peak, "p_features": feats})
-            if points:
+            # Big hurricane swaths can exceed the gateway's payload limit, so send
+            # ONE band per call (append mode) instead of all bands at once.
+            rpc(base, anon, "wind_swath_begin",
+                {"p_secret": secret, "p_state": st, "p_date": date_iso, "p_max_mph": peak})
+            for feat in feats:
+                rpc(base, anon, "wind_swath_add",
+                    {"p_secret": secret, "p_state": st, "p_date": date_iso,
+                     "p_feature": feat})
+            # points can also be large -> send in slices of 4000
+            for i in range(0, len(points), 4000):
                 rpc(base, anon, "ingest_wind_points",
-                    {"p_secret": secret, "p_state": st, "p_date": date_iso, "p_points": points})
+                    {"p_secret": secret, "p_state": st, "p_date": date_iso,
+                     "p_points": points[i:i+4000], "p_append": i > 0})
             stored += 1
             print(f"  {date_iso}  {st:16s} peak {peak:.0f} mph, {len(feats)} band(s)")
         except Exception as e:
@@ -222,7 +229,7 @@ def main():
                 cur += dt.timedelta(days=1)
         else:
             dates.append(tok)
-    step = int(os.environ.get("HOURS_STEP", "1"))
+    step = int((os.environ.get("HOURS_STEP") or "1").strip() or "1")
     base = os.environ["SUPABASE_URL"].rstrip("/")
     anon = os.environ["SUPABASE_ANON_KEY"]
     secret = os.environ["INGEST_SECRET"]
