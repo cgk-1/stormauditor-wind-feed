@@ -35,7 +35,7 @@ import requests
 from scipy.interpolate import griddata
 from rasterio.features import shapes
 from rasterio.transform import from_origin
-from shapely.geometry import shape, mapping, Point
+from shapely.geometry import shape, mapping, Point, MultiPolygon, Polygon
 from shapely.prepared import prep
 from shapely.ops import unary_union
 
@@ -57,15 +57,20 @@ PERMITTED_STATES = {
     "Rhode Island","South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
     "Virginia","Washington","West Virginia","Wisconsin","Wyoming",
 }
-BOUNDARY_URL = "https://raw.githubusercontent.com/glynnbird/usstatesgeojson/master/{slug}.geojson"
+BOUNDARY_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
+_ALL_STATES_CACHE = None
 _GEOM = {}
 
 
 def load_state_geom(name):
+    global _ALL_STATES_CACHE
     if name not in _GEOM:
-        url = BOUNDARY_URL.format(slug=name.lower().replace(" ", ""))
-        gj = json.loads(urllib.request.urlopen(url, timeout=60).read())
-        _GEOM[name] = shape(gj["geometry"] if "geometry" in gj else gj["features"][0]["geometry"]).buffer(0)
+        if _ALL_STATES_CACHE is None:
+            gj = json.loads(urllib.request.urlopen(BOUNDARY_URL, timeout=60).read())
+            _ALL_STATES_CACHE = {f["properties"]["name"]: f["geometry"] for f in gj["features"]}
+        if name not in _ALL_STATES_CACHE:
+            raise RuntimeError(f"no boundary found for {name}")
+        _GEOM[name] = shape(_ALL_STATES_CACHE[name]).buffer(0)
     return _GEOM[name]
 
 
@@ -159,8 +164,16 @@ def build_state(mph, dur, lats, lons, geom):
     feats = []
     for val, plist in sorted(band_polys.items()):
         merged = unary_union(plist).intersection(geom).simplify(0.01)
-        if not merged.is_empty:
-            feats.append({"band": val, "mph_min": BANDS[val - 1], "geom": mapping(merged)})
+        if merged.is_empty:
+            continue
+        if merged.geom_type == "Polygon":
+            merged = MultiPolygon([merged])          # column is MultiPolygon-typed
+        elif merged.geom_type != "MultiPolygon":
+            polys = [g for g in merged.geoms if isinstance(g, Polygon)] if hasattr(merged, "geoms") else []
+            if not polys:
+                continue
+            merged = MultiPolygon(polys)
+        feats.append({"band": val, "mph_min": BANDS[val - 1], "geom": mapping(merged)})
 
     # raw points >= floor inside the state for precise lookups; the reported
     # state peak and duration come ONLY from these in-state cells (never from
