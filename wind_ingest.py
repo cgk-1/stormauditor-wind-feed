@@ -106,27 +106,41 @@ def gust_slice(date_str, hh):
     return v
 
 
+DMG_MPH = 40  # damaging-wind threshold for duration counting
+
 def daily_max_mph(date_str, step=1):
-    dmax = None
-    for hh in range(0, 24, step):
-        v = gust_slice(date_str, hh)
+    """06Z-06Z 'convective day' max gust (mph) + per-cell hours >= DMG_MPH.
+    Matches the 6am-6am storm-day convention used in industry hail/wind
+    verification reports, so one overnight storm isn't split across dates."""
+    d0 = dt.datetime.strptime(date_str, "%Y%m%d").date()
+    d1 = (d0 + dt.timedelta(days=1)).strftime("%Y%m%d")
+    hours = [(date_str, hh) for hh in range(6, 24, step)] +             [(d1, hh) for hh in range(0, 6, step)]
+    dmax = None; dur = None
+    for ds, hh in hours:
+        v = gust_slice(ds, hh)
         if v is None:
             continue
-        dmax = v if dmax is None else np.fmax(dmax, v)
+        if dmax is None:
+            dmax = v.copy()
+            dur = (v * MS2MPH >= DMG_MPH).astype("int16") * step
+        else:
+            np.fmax(dmax, v, out=dmax)
+            dur += (v * MS2MPH >= DMG_MPH).astype("int16") * step
     if dmax is None:
-        return None, None, None
-    return dmax * MS2MPH, _GEOM["LATS"], _GEOM["LONS"]
+        return None, None, None, None
+    return dmax * MS2MPH, dur, _GEOM["LATS"], _GEOM["LONS"]
 
 
-def build_state(mph, lats, lons, geom):
+def build_state(mph, dur, lats, lons, geom):
     minx, miny, maxx, maxy = geom.bounds
     m = (lats >= miny - 0.2) & (lats <= maxy + 0.2) & (lons >= minx - 0.2) & (lons <= maxx + 0.2)
     if not m.any():
-        return [], [], 0.0
+        return [], [], 0, 0
     pts = np.column_stack([lons[m], lats[m]]); vals = mph[m]
-    peak = float(np.nanmax(vals))
-    if peak < POINT_FLOOR:
-        return [], [], int(round(peak))
+    dvals = dur[m] if dur is not None else np.zeros(vals.shape, dtype="int16")
+    # bbox pre-screen only; the reported peak below is strictly in-state
+    if float(np.nanmax(vals)) < POINT_FLOOR:
+        return [], [], 0, 0
 
     # resample Lambert -> regular grid for polygon bands
     gx = np.arange(minx, maxx, GRID_RES); gy = np.arange(miny, maxy, GRID_RES)
@@ -148,13 +162,19 @@ def build_state(mph, lats, lons, geom):
         if not merged.is_empty:
             feats.append({"band": val, "mph_min": BANDS[val - 1], "geom": mapping(merged)})
 
-    # raw points >= floor inside the state for precise lookups
-    pg = prep(geom); points = []
-    for (lon, lat), val in zip(pts, vals):
+    # raw points >= floor inside the state for precise lookups; the reported
+    # state peak and duration come ONLY from these in-state cells (never from
+    # bbox corners over water or neighboring states).
+    pg = prep(geom); points = []; peak_in = 0.0; dur_in = 0
+    for (lon, lat), val, dv in zip(pts, vals, dvals):
         if val >= POINT_FLOOR and pg.contains(Point(float(lon), float(lat))):
             points.append({"lon": round(float(lon), 3), "lat": round(float(lat), 3),
                            "v": int(round(float(val)))})
-    return feats, points, int(round(peak))
+            if val > peak_in: peak_in = float(val)
+            if dv > dur_in: dur_in = int(dv)
+    if not points:
+        return [], [], 0, 0
+    return feats, points, int(round(peak_in)), dur_in
 
 
 def rpc(base, anon, name, payload):
@@ -177,7 +197,7 @@ def rpc(base, anon, name, payload):
 
 def process_date(date_str, states, base, anon, secret, step):
     date_iso = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-    mph, lats, lons = daily_max_mph(date_str, step)
+    mph, dur, lats, lons = daily_max_mph(date_str, step)
     if mph is None:
         print(f"{date_iso}: no URMA data; skipping.")
         return 0
@@ -188,13 +208,14 @@ def process_date(date_str, states, base, anon, secret, step):
             continue
         try:
             geom = load_state_geom(st)
-            feats, points, peak = build_state(mph, lats, lons, geom)
+            feats, points, peak, dur_hrs = build_state(mph, dur, lats, lons, geom)
             if not feats:
                 continue
             # Big hurricane swaths can exceed the gateway's payload limit, so send
             # ONE band per call (append mode) instead of all bands at once.
             rpc(base, anon, "wind_swath_begin",
-                {"p_secret": secret, "p_state": st, "p_date": date_iso, "p_max_mph": peak})
+                {"p_secret": secret, "p_state": st, "p_date": date_iso,
+                 "p_max_mph": peak, "p_dur_hrs": dur_hrs})
             for feat in feats:
                 rpc(base, anon, "wind_swath_add",
                     {"p_secret": secret, "p_state": st, "p_date": date_iso,
