@@ -2,29 +2,19 @@
 """
 NOAA URMA wind-gust -> Supabase wind-swath ingester for stormauditor.com.
 
-Builds a daily "estimated maximum wind gust" product from NOAA's URMA -- the
-Unrestricted Mesoscale Analysis, which NOAA designates the *analysis of record*.
-URMA is a 2.5 km, hourly, quality-controlled variational analysis that
-assimilates surface station wind/gust observations (ASOS/METAR + mesonets) --
-i.e. measured station gusts turned into a grid the industry-standard way. It
-covers everyday severe/straight-line wind AND tropical systems in one product.
+PATCHED (Hazard Engine v2.3): after computing each date's national daily-max
+gust grid, this version also samples that grid at EVERY ASOS/AWOS station
+(uncapped, below-floor values included) and stores the values via the
+hz_station_bg_ingest RPC (src='ANL'). The Hazard Engine's SAWE-2 estimator
+uses these as exact objective-analysis backgrounds and as the interpolated
+background on days whose grid peaks fall below the 40 mph storage floor.
+Zero extra downloads: the grid is already in memory. If the hz_* RPCs are
+absent, the sampling step warns and is skipped; swath ingestion is unchanged.
 
-For a given UTC date it: byte-range downloads ONLY the GUST field from each
-hourly analysis (~5-6 MB/hour, not the 75 MB full file), takes the 24-hour max,
-classifies into severe + Saffir-Simpson wind bands, resamples the Lambert grid to
-regular lat/lon per state, polygonizes -> swaths, clips to the state, and pushes
-to Supabase via a locked RPC. It also stores raw grid values as points for
-precise per-address lookup, and purges anything older than 2 years.
+Everything else is identical to the previous version.
 
-Runs in GitHub Actions (free), never in Supabase/Lovable (which can't read GRIB2).
-
-Env (GitHub repo secrets):
-  SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
-Optional:
-  INGEST_DATE   YYYYMMDD or comma list (default: yesterday UTC)
-  STATES        comma list (default: all permitted)
-  HOURS_STEP    hour stride for the daily max (default 1; use 3 for fast backfill)
-
+Env (GitHub repo secrets): SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
+Optional: INGEST_DATE, STATES, HOURS_STEP
 Deps: pygrib numpy scipy rasterio shapely requests
 """
 import os, json, datetime as dt
@@ -40,11 +30,9 @@ from shapely.prepared import prep
 from shapely.ops import unary_union
 
 MS2MPH = 2.2369363
-# Band lower bounds in mph: 58 = NWS severe-wind criterion (50 kt); 74/96/111/130/157
-# = Saffir-Simpson Cat 1-5. 40 = damaging-wind floor (below it we store nothing).
 BANDS = [40, 58, 74, 96, 111, 130, 157]
-POINT_FLOOR = 40  # store raw grid values (mph) >= this for precise lookups
-GRID_RES = 0.02   # target regular grid resolution for swath polygons (deg)
+POINT_FLOOR = 40
+GRID_RES = 0.02
 
 BASE = "https://noaa-urma-pds.s3.amazonaws.com"
 
@@ -114,12 +102,11 @@ def gust_slice(date_str, hh):
 DMG_MPH = 40  # damaging-wind threshold for duration counting
 
 def daily_max_mph(date_str, step=1):
-    """06Z-06Z 'convective day' max gust (mph) + per-cell hours >= DMG_MPH.
-    Matches the 6am-6am storm-day convention used in industry hail/wind
-    verification reports, so one overnight storm isn't split across dates."""
+    """06Z-06Z 'convective day' max gust (mph) + per-cell hours >= DMG_MPH."""
     d0 = dt.datetime.strptime(date_str, "%Y%m%d").date()
     d1 = (d0 + dt.timedelta(days=1)).strftime("%Y%m%d")
-    hours = [(date_str, hh) for hh in range(6, 24, step)] +             [(d1, hh) for hh in range(0, 6, step)]
+    hours = [(date_str, hh) for hh in range(6, 24, step)] + \
+            [(d1, hh) for hh in range(0, 6, step)]
     dmax = None; dur = None
     for ds, hh in hours:
         v = gust_slice(ds, hh)
@@ -143,11 +130,9 @@ def build_state(mph, dur, lats, lons, geom):
         return [], [], 0, 0
     pts = np.column_stack([lons[m], lats[m]]); vals = mph[m]
     dvals = dur[m] if dur is not None else np.zeros(vals.shape, dtype="int16")
-    # bbox pre-screen only; the reported peak below is strictly in-state
     if float(np.nanmax(vals)) < POINT_FLOOR:
         return [], [], 0, 0
 
-    # resample Lambert -> regular grid for polygon bands
     gx = np.arange(minx, maxx, GRID_RES); gy = np.arange(miny, maxy, GRID_RES)
     GX, GY = np.meshgrid(gx, gy)
     grid = np.nan_to_num(griddata(pts, vals, (GX, GY), method="linear"), nan=0.0)
@@ -167,7 +152,7 @@ def build_state(mph, dur, lats, lons, geom):
         if merged.is_empty:
             continue
         if merged.geom_type == "Polygon":
-            merged = MultiPolygon([merged])          # column is MultiPolygon-typed
+            merged = MultiPolygon([merged])
         elif merged.geom_type != "MultiPolygon":
             polys = [g for g in merged.geoms if isinstance(g, Polygon)] if hasattr(merged, "geoms") else []
             if not polys:
@@ -175,9 +160,6 @@ def build_state(mph, dur, lats, lons, geom):
             merged = MultiPolygon(polys)
         feats.append({"band": val, "mph_min": BANDS[val - 1], "geom": mapping(merged)})
 
-    # raw points >= floor inside the state for precise lookups; the reported
-    # state peak and duration come ONLY from these in-state cells (never from
-    # bbox corners over water or neighboring states).
     pg = prep(geom); points = []; peak_in = 0.0; dur_in = 0
     for (lon, lat), val, dv in zip(pts, vals, dvals):
         if val >= POINT_FLOOR and pg.contains(Point(float(lon), float(lat))):
@@ -208,12 +190,58 @@ def rpc(base, anon, name, payload):
     raise RuntimeError(last)
 
 
+# ---------------- Hazard Engine v2.3: station background sampling ----------
+_HZ_STATIONS = None
+
+def _hz_load_stations(base, anon, secret):
+    """Station list from the Hazard Engine (fails soft if RPC absent)."""
+    global _HZ_STATIONS
+    if _HZ_STATIONS is None:
+        try:
+            r = rpc(base, anon, "hz_stations_fetch", {"p_secret": secret})
+            _HZ_STATIONS = r.json() if r.text and r.text != "null" else []
+        except Exception as e:
+            print(f"  [warn] hz_stations_fetch unavailable ({e}); "
+                  f"station backgrounds skipped")
+            _HZ_STATIONS = []
+    return _HZ_STATIONS
+
+
+def sample_station_bg(date_iso, mph, lats, lons, base, anon, secret):
+    """Sample the (uncapped) national daily-max gust grid at every station and
+    upload as SAWE-2 backgrounds. Zero extra downloads."""
+    stations = _hz_load_stations(base, anon, secret)
+    if not stations:
+        return
+    la = np.asarray(lats); lo = np.asarray(lons)
+    rows = []
+    for st in stations:
+        try:
+            j = int(np.argmin((la - st["lat"])**2 + (lo - st["lon"])**2))
+            yy, xx = np.unravel_index(j, la.shape)
+            rows.append({"stid": st["stid"],
+                         "bg": int(round(float(mph[yy, xx])))})
+        except Exception:
+            continue
+    try:
+        for i in range(0, len(rows), 3000):
+            rpc(base, anon, "hz_station_bg_ingest",
+                {"p_secret": secret, "p_date": date_iso, "p_src": "ANL",
+                 "p_rows": rows[i:i+3000], "p_append": i > 0})
+        print(f"  {date_iso}  station backgrounds: {len(rows)} sampled (ANL)")
+    except Exception as e:
+        print(f"  [warn] station bg upload failed: {e}")
+# ---------------------------------------------------------------------------
+
+
 def process_date(date_str, states, base, anon, secret, step):
     date_iso = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
     mph, dur, lats, lons = daily_max_mph(date_str, step)
     if mph is None:
         print(f"{date_iso}: no URMA data; skipping.")
         return 0
+    # Hazard Engine v2.3: uncapped backgrounds at every station, once per date
+    sample_station_bg(date_iso, mph, lats, lons, base, anon, secret)
     stored = 0
     for st in states:
         if st not in PERMITTED_STATES:
@@ -224,8 +252,6 @@ def process_date(date_str, states, base, anon, secret, step):
             feats, points, peak, dur_hrs = build_state(mph, dur, lats, lons, geom)
             if not feats:
                 continue
-            # Big hurricane swaths can exceed the gateway's payload limit, so send
-            # ONE band per call (append mode) instead of all bands at once.
             rpc(base, anon, "wind_swath_begin",
                 {"p_secret": secret, "p_state": st, "p_date": date_iso,
                  "p_max_mph": peak, "p_dur_hrs": dur_hrs})
@@ -233,7 +259,6 @@ def process_date(date_str, states, base, anon, secret, step):
                 rpc(base, anon, "wind_swath_add",
                     {"p_secret": secret, "p_state": st, "p_date": date_iso,
                      "p_feature": feat})
-            # points can also be large -> send in slices of 4000
             for i in range(0, len(points), 4000):
                 rpc(base, anon, "ingest_wind_points",
                     {"p_secret": secret, "p_state": st, "p_date": date_iso,
@@ -251,7 +276,6 @@ def process_date(date_str, states, base, anon, secret, step):
 def main():
     raw = os.environ.get("INGEST_DATE") or \
         (dt.datetime.utcnow().date() - dt.timedelta(days=1)).strftime("%Y%m%d")
-    # tokens may be single dates (YYYYMMDD) or inclusive ranges (YYYYMMDD:YYYYMMDD)
     dates = []
     for tok in [d.strip() for d in raw.split(",") if d.strip()]:
         if ":" in tok:
@@ -276,7 +300,6 @@ def main():
     for d in dates:
         total += process_date(d, states, base, anon, secret, step)
 
-    # 2-year retention: purge anything older than today-2y
     try:
         rpc(base, anon, "purge_old_wind", {"p_secret": secret})
         print("Purged wind data older than 2 years.")
