@@ -231,6 +231,21 @@ def sample_station_bg(date_iso, mph, lats, lons, base, anon, secret):
         print(f"  {date_iso}  station backgrounds: {len(rows)} sampled (ANL)")
     except Exception as e:
         print(f"  [warn] station bg upload failed: {e}")
+    # v2.6: uncapped coarse field samples of the daily-max analysis
+    try:
+        sub = mph[::10, ::10]; sla = la[::10, ::10]; slo = lo[::10, ::10]
+        yy, xx = (sub >= 5).nonzero()
+        pts = [{"lon": round(float(slo[a, b]), 2),
+                "lat": round(float(sla[a, b]), 2),
+                "v": int(round(float(sub[a, b])))}
+               for a, b in zip(yy.tolist(), xx.tolist())]
+        for i in range(0, len(pts), 4000):
+            rpc(base, anon, "hz_bg_coarse_ingest",
+                {"p_secret": secret, "p_date": date_iso, "p_src": "ANL",
+                 "p_points": pts[i:i+4000]})
+        print(f"  {date_iso}  coarse field samples: {len(pts)} (ANL)")
+    except Exception as e:
+        print(f"  [warn] coarse upload failed: {e}")
 # ---------------------------------------------------------------------------
 
 
