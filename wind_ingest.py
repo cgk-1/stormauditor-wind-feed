@@ -257,6 +257,8 @@ def process_date(date_str, states, base, anon, secret, step):
         return 0
     # Hazard Engine v2.3: uncapped backgrounds at every station, once per date
     sample_station_bg(date_iso, mph, lats, lons, base, anon, secret)
+    if os.environ.get("BG_ONLY") == "1":
+        return 1   # backgrounds + field samples written; skip swath rebuild
     stored = 0
     for st in states:
         if st not in PERMITTED_STATES:
