@@ -1,0 +1,24 @@
+name: anl-bg-backfill
+on:
+  schedule:
+    - cron: "40 1,5,9,13,17,21 * * *"
+  workflow_dispatch:
+    inputs:
+      time_budget_min: {description: "minutes", default: "100"}
+jobs:
+  walk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    concurrency: {group: anl-bg-backfill, cancel-in-progress: false}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: sudo apt-get update -q && sudo apt-get install -y -q libeccodes-dev
+      - run: pip install numpy scipy pygrib rasterio shapely requests
+      - env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          TIME_BUDGET_MIN: ${{ github.event.inputs.time_budget_min || '100' }}
+        run: python wind_bg_walker.py
