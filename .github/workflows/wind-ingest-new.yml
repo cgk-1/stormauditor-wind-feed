@@ -2,7 +2,7 @@ name: wind-ingest-newdb
 
 on:
   schedule:
-    - cron: "0 8 * * *"      # ~08:30 UTC daily; ingests yesterday + purges >2yr
+    - cron: "0 10 * * *"   # 10z: after every state's local day fully ends (PT/AZ end 07z) + URMA latency
   workflow_dispatch:
     inputs:
       date:

@@ -18,6 +18,7 @@ Optional: INGEST_DATE, STATES, HOURS_STEP
 Deps: pygrib numpy scipy rasterio shapely requests
 """
 import os, json, datetime as dt
+from zoneinfo import ZoneInfo
 import urllib.request
 import numpy as np
 import pygrib
@@ -36,15 +37,27 @@ GRID_RES = 0.02
 
 BASE = "https://noaa-urma-pds.s3.amazonaws.com"
 
-PERMITTED_STATES = {
-    "Alabama","Arizona","Arkansas","California","Colorado","Connecticut","Delaware",
-    "Florida","Georgia","Idaho","Illinois","Indiana","Iowa","Kansas","Kentucky",
-    "Louisiana","Maine","Maryland","Massachusetts","Michigan","Minnesota","Mississippi",
-    "Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey","New Mexico",
-    "New York","North Carolina","North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania",
-    "Rhode Island","South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
-    "Virginia","Washington","West Virginia","Wisconsin","Wyoming",
+# Dominant IANA timezone per state (same convention as the hail feed, so
+# wind and hail explorer dates agree with a homeowner's local clock).
+STATE_TZ = {
+ "Alabama":"America/Chicago","Arizona":"America/Phoenix","Arkansas":"America/Chicago",
+ "California":"America/Los_Angeles","Colorado":"America/Denver","Connecticut":"America/New_York",
+ "Delaware":"America/New_York","Florida":"America/New_York","Georgia":"America/New_York",
+ "Idaho":"America/Boise","Illinois":"America/Chicago","Indiana":"America/Indiana/Indianapolis",
+ "Iowa":"America/Chicago","Kansas":"America/Chicago","Kentucky":"America/New_York",
+ "Louisiana":"America/Chicago","Maine":"America/New_York","Maryland":"America/New_York",
+ "Massachusetts":"America/New_York","Michigan":"America/Detroit","Minnesota":"America/Chicago",
+ "Mississippi":"America/Chicago","Missouri":"America/Chicago","Montana":"America/Denver",
+ "Nebraska":"America/Chicago","Nevada":"America/Los_Angeles","New Hampshire":"America/New_York",
+ "New Jersey":"America/New_York","New Mexico":"America/Denver","New York":"America/New_York",
+ "North Carolina":"America/New_York","North Dakota":"America/Chicago","Ohio":"America/New_York",
+ "Oklahoma":"America/Chicago","Oregon":"America/Los_Angeles","Pennsylvania":"America/New_York",
+ "Rhode Island":"America/New_York","South Carolina":"America/New_York","South Dakota":"America/Chicago",
+ "Tennessee":"America/Chicago","Texas":"America/Chicago","Utah":"America/Denver",
+ "Vermont":"America/New_York","Virginia":"America/New_York","Washington":"America/Los_Angeles",
+ "West Virginia":"America/New_York","Wisconsin":"America/Chicago","Wyoming":"America/Denver",
 }
+PERMITTED_STATES = set(STATE_TZ)
 BOUNDARY_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
 _ALL_STATES_CACHE = None
 _GEOM = {}
@@ -101,15 +114,36 @@ def gust_slice(date_str, hh):
 
 DMG_MPH = 40  # damaging-wind threshold for duration counting
 
-def daily_max_mph(date_str, step=1):
-    """06Z-06Z 'convective day' max gust (mph) + per-cell hours >= DMG_MPH."""
-    d0 = dt.datetime.strptime(date_str, "%Y%m%d").date()
-    d1 = (d0 + dt.timedelta(days=1)).strftime("%Y%m%d")
-    hours = [(date_str, hh) for hh in range(6, 24, step)] + \
-            [(d1, hh) for hh in range(0, 6, step)]
+_SLICE_CACHE = {}
+
+def gust_slice_cached(ds, hh):
+    key = (ds, hh)
+    if key not in _SLICE_CACHE:
+        _SLICE_CACHE[key] = gust_slice(ds, hh)
+    return _SLICE_CACHE[key]
+
+
+def window_hours_utc(tzname, date_str, step=1):
+    """UTC (date_str, hour) pairs covering local calendar day D
+    (local midnight -> local midnight, DST-aware) in tzname."""
+    tz = ZoneInfo(tzname)
+    y, m, d = int(date_str[:4]), int(date_str[4:6]), int(date_str[6:])
+    start = dt.datetime(y, m, d, tzinfo=tz).astimezone(dt.timezone.utc)
+    end = (dt.datetime(y, m, d, tzinfo=tz) + dt.timedelta(days=1)).astimezone(dt.timezone.utc)
+    start = start.replace(minute=0, second=0, microsecond=0)
+    hours = []
+    cur = start
+    while cur < end:
+        hours.append((cur.strftime("%Y%m%d"), cur.hour))
+        cur += dt.timedelta(hours=step)
+    return hours
+
+
+def window_max_mph(hours, step=1):
+    """Max gust (mph) + per-cell hours >= DMG_MPH over the given hour list."""
     dmax = None; dur = None
     for ds, hh in hours:
-        v = gust_slice(ds, hh)
+        v = gust_slice_cached(ds, hh)
         if v is None:
             continue
         if dmax is None:
@@ -120,7 +154,18 @@ def daily_max_mph(date_str, step=1):
             dur += (v * MS2MPH >= DMG_MPH).astype("int16") * step
     if dmax is None:
         return None, None, None, None
-    return dmax * MS2MPH, dur, _GEOM["LATS"], _GEOM["LONS"]
+    return dmax * MS2MPH, dur, _GEOM.get("LATS"), _GEOM.get("LONS")
+
+
+def daily_max_mph(date_str, step=1):
+    """Legacy 06Z-06Z 'convective day' window — still used for the national
+    hazard-engine backgrounds so hz_station_bg / hz_bg_coarse semantics are
+    unchanged. Explorer state products now use per-state local-day windows."""
+    d0 = dt.datetime.strptime(date_str, "%Y%m%d").date()
+    d1 = (d0 + dt.timedelta(days=1)).strftime("%Y%m%d")
+    hours = [(date_str, hh) for hh in range(6, 24, step)] + \
+            [(d1, hh) for hh in range(0, 6, step)]
+    return window_max_mph(hours, step)
 
 
 def build_state(mph, dur, lats, lons, geom):
@@ -251,40 +296,60 @@ def sample_station_bg(date_iso, mph, lats, lons, base, anon, secret):
 
 def process_date(date_str, states, base, anon, secret, step):
     date_iso = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-    mph, dur, lats, lons = daily_max_mph(date_str, step)
-    if mph is None:
+    _SLICE_CACHE.clear()
+
+    # National hazard-engine backgrounds: unchanged legacy 06Z-06Z window.
+    mph_bg, dur_bg, lats, lons = daily_max_mph(date_str, step)
+    if mph_bg is None:
         print(f"{date_iso}: no URMA data; skipping.")
+        _SLICE_CACHE.clear()
         return 0
-    # Hazard Engine v2.3: uncapped backgrounds at every station, once per date
-    sample_station_bg(date_iso, mph, lats, lons, base, anon, secret)
+    sample_station_bg(date_iso, mph_bg, lats, lons, base, anon, secret)
+    del mph_bg, dur_bg
     if os.environ.get("BG_ONLY") == "1":
+        _SLICE_CACHE.clear()
         return 1   # backgrounds + field samples written; skip swath rebuild
-    stored = 0
+
+    # Explorer products: per-state LOCAL calendar day (dominant state timezone),
+    # so a state's "July 21" is July 21 on a local clock, matching the hail feed.
+    groups = {}
     for st in states:
         if st not in PERMITTED_STATES:
             print(f"  [skip] {st} not permitted")
             continue
-        try:
-            geom = load_state_geom(st)
-            feats, points, peak, dur_hrs = build_state(mph, dur, lats, lons, geom)
-            if not feats:
-                continue
-            rpc(base, anon, "wind_swath_begin",
-                {"p_secret": secret, "p_state": st, "p_date": date_iso,
-                 "p_max_mph": peak, "p_dur_hrs": dur_hrs})
-            for feat in feats:
-                rpc(base, anon, "wind_swath_add",
+        groups.setdefault(STATE_TZ[st], []).append(st)
+
+    stored = 0
+    for tzname, group_states in sorted(groups.items()):
+        hours = window_hours_utc(tzname, date_str, step)
+        mph, dur, lats, lons = window_max_mph(hours, step)
+        if mph is None:
+            print(f"  {date_iso}  [{tzname}] no URMA data for window; skipping group.")
+            continue
+        for st in group_states:
+            try:
+                geom = load_state_geom(st)
+                feats, points, peak, dur_hrs = build_state(mph, dur, lats, lons, geom)
+                if not feats:
+                    continue
+                rpc(base, anon, "wind_swath_begin",
                     {"p_secret": secret, "p_state": st, "p_date": date_iso,
-                     "p_feature": feat})
-            for i in range(0, len(points), 4000):
-                rpc(base, anon, "ingest_wind_points",
-                    {"p_secret": secret, "p_state": st, "p_date": date_iso,
-                     "p_points": points[i:i+4000], "p_append": i > 0})
-            stored += 1
-            print(f"  {date_iso}  {st:16s} peak {peak:.0f} mph, {len(feats)} band(s)")
-            import time as _t; _t.sleep(float(os.environ.get("STATE_PAUSE", "0.4")))
-        except Exception as e:
-            print(f"  [error] {date_iso} {st}: {e}")
+                     "p_max_mph": peak, "p_dur_hrs": dur_hrs})
+                for feat in feats:
+                    rpc(base, anon, "wind_swath_add",
+                        {"p_secret": secret, "p_state": st, "p_date": date_iso,
+                         "p_feature": feat})
+                for i in range(0, len(points), 4000):
+                    rpc(base, anon, "ingest_wind_points",
+                        {"p_secret": secret, "p_state": st, "p_date": date_iso,
+                         "p_points": points[i:i+4000], "p_append": i > 0})
+                stored += 1
+                print(f"  {date_iso}  {st:16s} [{tzname.split('/')[-1]}] peak {peak:.0f} mph, {len(feats)} band(s)")
+                import time as _t; _t.sleep(float(os.environ.get("STATE_PAUSE", "0.4")))
+            except Exception as e:
+                print(f"  [error] {date_iso} {st}: {e}")
+        del mph, dur
+    _SLICE_CACHE.clear()
     if stored == 0:
         print(f"{date_iso}: no >= {POINT_FLOOR} mph wind on land in selected state(s).")
     return stored
