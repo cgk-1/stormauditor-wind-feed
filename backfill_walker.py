@@ -42,7 +42,7 @@ def main():
     start = dt.datetime.strptime(os.environ["START_DATE"], "%Y%m%d").date() \
             if os.environ.get("START_DATE") else today - dt.timedelta(days=730)
 
-    cur = rpc(base, anon, "backfill_get", {"p_key": "wind"})
+    cur = rpc(base, anon, "backfill_get", {"p_key": "wind", "p_secret": secret})
     cursor = dt.datetime.strptime(cur, "%Y-%m-%d").date() if cur else end + dt.timedelta(days=1)
 
     states = sorted(w.PERMITTED_STATES)
@@ -67,7 +67,7 @@ def main():
             # wedge the walker. Transient errors are already retried inside
             # process_date's download/rpc layers.
             print(f"  [error] {day}: {e} -- advancing past it")
-        rpc(base, anon, "backfill_set", {"p_key": "wind", "p_value": day.strftime("%Y-%m-%d")})
+        rpc(base, anon, "backfill_set", {"p_key": "wind", "p_value": day.strftime("%Y-%m-%d"), "p_secret": secret})
         cursor = day
         done += 1
 
