@@ -217,6 +217,20 @@ def build_state(mph, dur, lats, lons, geom):
     return feats, points, int(round(peak_in)), dur_in
 
 
+def db_day_states(base, anon, date_iso):
+    """How many states already have wind rows for date_iso (-1 = unknown)."""
+    try:
+        r = requests.get(f"{base}/rest/v1/wind_days",
+                         params={"valid_date": f"eq.{date_iso}", "select": "state"},
+                         headers={"apikey": anon, "Authorization": f"Bearer {anon}",
+                                  "Prefer": "count=exact", "Range": "0-0"},
+                         timeout=30)
+        cr = r.headers.get("Content-Range", "")
+        return int(cr.split("/")[-1]) if "/" in cr else -1
+    except Exception:
+        return -1
+
+
 def rpc(base, anon, name, payload):
     import time as _t
     last = ""
@@ -356,24 +370,37 @@ def process_date(date_str, states, base, anon, secret, step):
 
 
 def main():
-    raw = os.environ.get("INGEST_DATE") or \
-        (dt.datetime.utcnow().date() - dt.timedelta(days=1)).strftime("%Y%m%d")
-    dates = []
-    for tok in [d.strip() for d in raw.split(",") if d.strip()]:
-        if ":" in tok:
-            a, b = tok.split(":")
-            d0 = dt.datetime.strptime(a, "%Y%m%d").date()
-            d1 = dt.datetime.strptime(b, "%Y%m%d").date()
-            cur = d0
-            while cur <= d1:
-                dates.append(cur.strftime("%Y%m%d"))
-                cur += dt.timedelta(days=1)
-        else:
-            dates.append(tok)
     step = int((os.environ.get("HOURS_STEP") or "1").strip() or "1")
     base = os.environ["SUPABASE_URL"].rstrip("/")
     anon = os.environ["SUPABASE_ANON_KEY"]
     secret = os.environ["INGEST_SECRET"]
+
+    raw = os.environ.get("INGEST_DATE")
+    dates = []
+    if raw:
+        for tok in [d.strip() for d in raw.split(",") if d.strip()]:
+            if ":" in tok:
+                a, b = tok.split(":")
+                d0 = dt.datetime.strptime(a, "%Y%m%d").date()
+                d1 = dt.datetime.strptime(b, "%Y%m%d").date()
+                cur = d0
+                while cur <= d1:
+                    dates.append(cur.strftime("%Y%m%d"))
+                    cur += dt.timedelta(days=1)
+            else:
+                dates.append(tok)
+    else:
+        # Scheduled run: yesterday, PLUS SELF-HEAL (2026-08-27): re-ingest any
+        # of the 2 days before that with ZERO ingested states — catches late
+        # URMA availability and skipped Actions runs (the 2026-08-26
+        # nationwide miss). Quiet national days are re-checked harmlessly.
+        today = dt.datetime.utcnow().date()
+        dates.append((today - dt.timedelta(days=1)).strftime("%Y%m%d"))
+        for back in (2, 3):
+            d = today - dt.timedelta(days=back)
+            if db_day_states(base, anon, d.strftime("%Y-%m-%d")) == 0:
+                print(f"[self-heal] {d} has zero ingested states — re-running that date")
+                dates.append(d.strftime("%Y%m%d"))
     states_env = os.environ.get("STATES")
     states = ([s.strip() for s in states_env.split(",")] if states_env else sorted(PERMITTED_STATES))
 
