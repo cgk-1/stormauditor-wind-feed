@@ -3,6 +3,10 @@ name: wind-ingest-newdb
 on:
   schedule:
     - cron: "0 10 * * *"   # 10z: after every state's local day fully ends (PT/AZ end 07z) + URMA latency
+    # Second daily pass (2026-08-27): self-heal sweep — re-runs any of the
+    # last 3 days that ingested zero states (late URMA files or a skipped
+    # morning run, e.g. the 2026-08-26 nationwide miss).
+    - cron: "30 16 * * *"
   workflow_dispatch:
     inputs:
       date:
