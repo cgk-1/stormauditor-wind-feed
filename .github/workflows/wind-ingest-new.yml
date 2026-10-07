@@ -21,6 +21,9 @@ on:
       dry_run:
         description: "1 = compute everything, write nothing (payload md5 + row counts in the summary/artifact)."
         required: false
+      day_convention:
+        description: "v3 (default, empty) or v4 (Phase 5 own-zone local days; dry-run first, owner OK before any write)"
+        required: false
 
 # One run at a time; a second trigger queues behind the first (never cancels it).
 concurrency: {group: wind-ingest, cancel-in-progress: false}
@@ -46,6 +49,7 @@ jobs:
           STATES:            ${{ github.event.inputs.states }}
           HOURS_STEP:        ${{ github.event.inputs.hours_step }}
           DRY_RUN:           ${{ github.event.inputs.dry_run }}
+          DAY_CONVENTION:    ${{ github.event.inputs.day_convention }}
           FEED_OUT_DIR:      feed-out
         run: python wind_ingest.py
       - name: Upload run record (summary JSON, quarantine records, dry-run payloads)
