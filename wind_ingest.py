@@ -788,15 +788,17 @@ def process_date_v4(run, date_str, states, step, policy, flags, bg_only=False):
         run.receive(key, "windows")
         fields[g] = (mph, dur)
 
-    if real and fields:
-        gmap = dg.lut[zm.zone]
-        mph_any = np.max(np.stack([f[0] for f in fields.values()]), axis=0)
-        dur_any = np.max(np.stack([f[1] for f in fields.values()]), axis=0)
-        # zone-0 cells (>1 deg from US territory) are never stored; they get the
-        # max over all windows so the interpolation input is fully defined.
-        comp_mph = tzwin.compose(gmap, {g: f[0] for g, f in fields.items()}, mph_any)
-        comp_dur = tzwin.compose(gmap, {g: f[1] for g, f in fields.items()}, dur_any)
-        del mph_any, dur_any
+    comps = {}
+
+    def composite(g_state):
+        """Own-zone field for the states of window group g_state: every cell takes
+        its own zone's window; cells with no US zone (> 1 deg from US land and
+        waters, never stored) keep the state's own window, i.e. exactly v3."""
+        if g_state not in comps:
+            gmap = dg.lut[zm.zone]
+            comps[g_state] = (tzwin.compose(gmap, {g: f[0] for g, f in fields.items()}, fields[g_state][0]),
+                              tzwin.compose(gmap, {g: f[1] for g, f in fields.items()}, fields[g_state][1]))
+        return comps[g_state]
 
     # Same iteration (and payload) order as v3: by state tz name, then input order.
     by_tz = {}
@@ -812,7 +814,7 @@ def process_date_v4(run, date_str, states, step, policy, flags, bg_only=False):
             try:
                 geom = geoms[st]
                 if real:
-                    mph, dur = comp_mph, comp_dur
+                    mph, dur = composite(st_group[st])
                 else:
                     mph, dur = fields[st_group[st]]
                 feats, points, peak, dur_hrs = build_state(mph, dur, LA, LO, geom)
