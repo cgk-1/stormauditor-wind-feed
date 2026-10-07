@@ -984,6 +984,11 @@ def main(run):
           f"hours policy {policy}{' [BG_ONLY]' if bg_only else ''}{f' {flags}' if flags else ''}")
     total = 0
     for d in dates:
+        key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        # Redo shadow (explicit-date runs only): snapshot the day's old rows first;
+        # no snapshot -> the day is not written (clearstep.py).
+        if not clearstep.before_day(run, key, "ANL", explicit=explicit is not None):
+            continue
         if conv == "v4":
             total += process_date_v4(run, d, states, step, policy, flags, bg_only)
         else:
@@ -994,9 +999,15 @@ def main(run):
         # wind_points rows (clearstep.py). Not with BG_ONLY (no state is written
         # there) and not with HOURS_POLICY=legacy (test replays of short windows).
         if not bg_only and policy != "legacy":
-            key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
             clearstep.after_day(run, key, "ANL", states, run.day(key)["written"],
                                 explicit=explicit is not None)
+            if explicit is not None:
+                exp = {"wind_points": clearstep.rows(run, key, "ingest_wind_points.p_points"),
+                       "hz_station_bg": clearstep.rows(run, key, "hz_station_bg_ingest.p_rows")}
+                if set(states) == set(PERMITTED_STATES):
+                    exp.update({"wind_days_feed": len([s for s in run.day(key)["written"] if s in PERMITTED_STATES]),
+                                "wind_polygons": clearstep.rows(run, key, "wind_swath_add.p_feature")})
+                clearstep.postcheck(run, key, "ANL", exp)
 
     if not run.dry_run and not bg_only:
         try:
