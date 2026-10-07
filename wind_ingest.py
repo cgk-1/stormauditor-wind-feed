@@ -650,7 +650,7 @@ def process_date(run, date_str, states, step, policy, bg_only=False):
                     run.empty(key, st)
                     continue
                 validate_state_output(st, geom, feats, points, peak, dur_hrs)
-                calls = [("wind_swath_begin",
+                calls = [(SWATH_BEGIN_RPC,
                           {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
                            "p_max_mph": peak, "p_dur_hrs": dur_hrs})]
                 for feat in feats:
@@ -678,6 +678,12 @@ def process_date(run, date_str, states, step, policy, bg_only=False):
     if stored == 0 and not d["failed"]:
         print(f"{date_iso}: no >= {POINT_FLOOR} mph wind on land in selected state(s).")
     return stored
+
+
+# Owner-approved 2026-10-07: wind_swath_begin_v2 also clears obs_only when the
+# grid lands (a deferred day can be rescued at 12:00Z before its grid exists).
+# legacy keeps v1 so test replays reproduce the stored night-one calls.
+SWATH_BEGIN_RPC = "wind_swath_begin_v2"
 
 
 def check_obs_only(run, key, written):
@@ -720,6 +726,8 @@ def main(run):
         ("strict" if explicit is not None else "defer")
     if policy not in ("strict", "defer", "legacy"):
         raise fg.ValidationError(f"HOURS_POLICY={policy!r} (use defer, strict or legacy)")
+    global SWATH_BEGIN_RPC
+    SWATH_BEGIN_RPC = "wind_swath_begin" if policy == "legacy" else "wind_swath_begin_v2"
     heal_from = (os.environ.get("HEAL_SHORT_WINDOWS_FROM") or "").strip()
     heal_from = fg._one_date(heal_from) if heal_from else None
     run.meta.update({"boundary_md5": BOUNDARY_MD5, "hours_policy": policy, "hours_step": step,
