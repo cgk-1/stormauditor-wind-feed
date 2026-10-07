@@ -49,9 +49,21 @@ payloads are byte-identical to the previous version for the same input hours:
   * DRY_RUN=1, DATE=YYYY-MM-DD|START..END, completeness summary and the
     FEED_RESULT json line: see feedguard.py.
 
+DAY_CONVENTION=v4 (Archive Phase 5 Stage 3, 2026-10-07; default v3 = unchanged):
+  the explorer products (wind_days / wind_polygons / wind_points) use each
+  URMA cell's OWN zone's local day (tzwin.py, data/tz/tz_urma.npz) instead of
+  its state's zone (plan T1). The 4-5 zone windows are exactly the hours the
+  state groups already download (one shared slice cache): no extra downloads.
+  Each cell takes the window max / >=40 mph hour count of its own zone's
+  window; the state clip, interpolation, banding, rounding and payload layout
+  are unchanged. DST days were already exact (23/25 h windows). The 06Z-06Z
+  national backgrounds (hz_station_bg ANL, hz_bg_coarse ANL) are NOT changed
+  (plan T6, kept for Phase 5). Test flags (DRY_RUN only): V4_ZONES=state.
+
 Env (GitHub repo secrets): SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
 Optional: DATE / INGEST_DATE, STATES, HOURS_STEP, HOURS_POLICY, BG_ONLY,
-          HEAL_SHORT_WINDOWS_FROM, URMA_PUBLISH_GRACE_H,
+          HEAL_SHORT_WINDOWS_FROM, URMA_PUBLISH_GRACE_H, DAY_CONVENTION (v3|v4),
+          V4_ZONES / V4_DST (dry-run test flags),
           DRY_RUN, FEED_OUT_DIR, STATE_PAUSE, HZ_STATIONS_FILE (offline station
           list for dry runs without the secret)
 Deps: requirements.txt (exact pins)
@@ -68,6 +80,7 @@ from shapely.prepared import prep
 from shapely.ops import unary_union
 
 import feedguard as fg
+import tzwin
 
 MS2MPH = 2.2369363
 BANDS = [40, 58, 74, 96, 111, 130, 157]
@@ -408,10 +421,11 @@ def _recent(ds, hh):
     return dt.datetime.now(UTC) - valid < dt.timedelta(hours=URMA_PUBLISH_GRACE_H)
 
 
-def preflight(run, key, date_str, states, step, policy, bg=True):
+def preflight(run, key, date_str, states, step, policy, bg=True, need=None):
     """True when every needed hour is published. Otherwise defers the day
-    (policy defer, all missing hours recent) or fails it - before ANY write."""
-    need = needed_hours(date_str, states, step, bg)
+    (policy defer, all missing hours recent) or fails it - before ANY write.
+    need: explicit hour list (v4); default = the v3 set."""
+    need = need if need is not None else needed_hours(date_str, states, step, bg)
     missing = [h for h in need if not hour_published(*h)[0]]
     run.set_received(key, "hours_needed", len(need))
     run.set_received(key, "hours_published", len(need) - len(missing))
@@ -680,6 +694,172 @@ def process_date(run, date_str, states, step, policy, bg_only=False):
     return stored
 
 
+# ===================================================================== v4
+# DAY_CONVENTION=v4 (Archive Phase 5 Stage 3): own-zone local day per URMA cell
+# for the explorer products. Used only when DAY_CONVENTION=v4.
+
+LOWER48_ZONE_IDS = range(1, 22)     # tz MANIFEST ids 1..21 = the lower-48 zones
+
+
+def needed_hours_v4(date_str, states, step=1, bg=True):
+    """v3's hour set plus every lower-48 zone window (identical on CONUS: the
+    zone families are the same as the state zones')."""
+    need = set(needed_hours(date_str, states, step, bg))
+    names = tzwin.zone_names()
+    for z in LOWER48_ZONE_IDS:
+        need.update(window_hours_utc(names[z], date_str, step))
+    return sorted(need)
+
+
+def process_date_v4(run, date_str, states, step, policy, flags, bg_only=False):
+    real = flags["zones"] == "real"
+    date_iso = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    key = date_iso
+    _SLICE_CACHE.clear()
+    run.expect(key, "states", len(states))
+    if policy in ("defer", "strict") and not preflight(
+            run, key, date_str, states, step, policy, bg=True,
+            need=needed_hours_v4(date_str, states, step, True)):
+        return 0
+
+    # National hazard-engine backgrounds: unchanged legacy 06Z-06Z window (T6).
+    bg_hours = bg_window_hours(date_str, step)
+    missing = []
+    try:
+        mph_bg, dur_bg, lats, lons = daily_max_mph(date_str, step, missing)
+        if hours_ok(run, key, "ANL background 06Z-06Z", bg_hours, missing, policy, mph_bg is not None):
+            if mph_bg is None:
+                raise fg.UpstreamMissing("no URMA hour available for the 06Z-06Z window")
+            sample_station_bg(run, key, date_iso, mph_bg, lats, lons)
+        del mph_bg, dur_bg
+    except Exception as e:
+        run.error(key, "ANL background 06Z-06Z", f"{type(e).__name__}: {e}")
+    if bg_only:
+        _SLICE_CACHE.clear()
+        return 0
+
+    zm = tzwin.zone_map("urma")
+    if "LATS" not in _GEOM:      # lat/lon of the grid come with the first decoded slice
+        for h in window_hours_utc(STATE_TZ[states[0]], date_str, step):
+            try:
+                if gust_slice_cached(*h) is not None:
+                    break
+            except fg.FeedError:
+                continue
+    if "LATS" not in _GEOM:
+        run.error(key, "URMA grid", "no URMA hour could be decoded")
+        return 0
+    LA, LO = _GEOM["LATS"], _GEOM["LONS"]
+    if LA.shape != zm.zone.shape:
+        raise fg.ValidationError(f"URMA grid {LA.shape} != zone map {zm.zone.shape}")
+    geoms = {st: load_state_geom(st) for st in states}
+    st_zone = {st: tzwin.zone_id(STATE_TZ[st]) for st in states}
+    st_zones, bbox = {}, {}
+    for st in states:
+        minx, miny, maxx, maxy = geoms[st].bounds
+        m = (LA >= miny - 0.2) & (LA <= maxy + 0.2) & (LO >= minx - 0.2) & (LO <= maxx + 0.2)
+        bbox[st] = m
+        zs = set(np.unique(zm.zone[m]).tolist()) - {0} if real else set()
+        st_zones[st] = zs | {st_zone[st]}
+    dg = tzwin.DayGroups(date_str, set().union(*st_zones.values()))
+    st_group = {st: tzwin.group_of_window(dg, tzwin.local_window(STATE_TZ[st], date_str)) for st in states}
+    st_groups = {st: sorted({int(dg.lut[z]) for z in st_zones[st]}) for st in states}
+    used = sorted({g for st in states for g in st_groups[st]})
+    run.day(key)["v4_groups"] = dg.describe()
+    run.expect(key, "windows", len(used))
+
+    fields, failed_g = {}, {}
+    for g in used:
+        rep = dg.members[g][0]
+        scope = f"window {rep}"
+        hours = window_hours_utc(rep, date_str, step)
+        missing = []
+        try:
+            mph, dur, _la, _lo = window_max_mph(hours, step, missing)
+            ok = hours_ok(run, key, scope, hours, missing, policy, mph is not None)
+            if ok and mph is None:
+                raise fg.UpstreamMissing("no URMA hour available for the window")
+        except Exception as e:
+            run.error(key, scope, f"{type(e).__name__}: {e}")
+            ok = False
+        if not ok:
+            failed_g[g] = scope
+            continue
+        run.receive(key, "windows")
+        fields[g] = (mph, dur)
+
+    if real and fields:
+        gmap = dg.lut[zm.zone]
+        mph_any = np.max(np.stack([f[0] for f in fields.values()]), axis=0)
+        dur_any = np.max(np.stack([f[1] for f in fields.values()]), axis=0)
+        # zone-0 cells (>1 deg from US territory) are never stored; they get the
+        # max over all windows so the interpolation input is fully defined.
+        comp_mph = tzwin.compose(gmap, {g: f[0] for g, f in fields.items()}, mph_any)
+        comp_dur = tzwin.compose(gmap, {g: f[1] for g, f in fields.items()}, dur_any)
+        del mph_any, dur_any
+
+    # Same iteration (and payload) order as v3: by state tz name, then input order.
+    by_tz = {}
+    for st in states:
+        by_tz.setdefault(STATE_TZ[st], []).append(st)
+    stored = 0
+    for tzname, group_states in sorted(by_tz.items()):
+        for st in group_states:
+            bad = [g for g in st_groups[st] if g in failed_g]
+            if bad:
+                run.day(key)["failed"].append(st)
+                continue
+            try:
+                geom = geoms[st]
+                if real:
+                    mph, dur = comp_mph, comp_dur
+                else:
+                    mph, dur = fields[st_group[st]]
+                feats, points, peak, dur_hrs = build_state(mph, dur, LA, LO, geom)
+                if not feats:
+                    run.empty(key, st)
+                    continue
+                if real:
+                    m = bbox[st]
+                    zone_at = dict(zip(((round(float(x), 3), round(float(y), 3))
+                                        for x, y in zip(LO[m].tolist(), LA[m].tolist())),
+                                       zm.zone[m].tolist()))
+                    for p in points:
+                        z = zone_at.get((p["lon"], p["lat"]))
+                        if not z:
+                            raise fg.ValidationError(f"{st}: stored cell {p['lon']},{p['lat']} has no US "
+                                                     f"zone (zone id {z})")
+                validate_state_output(st, geom, feats, points, peak, dur_hrs)
+                calls = [(SWATH_BEGIN_RPC,
+                          {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
+                           "p_max_mph": peak, "p_dur_hrs": dur_hrs})]
+                for feat in feats:
+                    calls.append(("wind_swath_add",
+                                  {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
+                                   "p_feature": feat}))
+                for i in range(0, len(points), 4000):
+                    calls.append(("ingest_wind_points",
+                                  {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
+                                   "p_points": points[i:i+4000], "p_append": i > 0}))
+                run.write(key, st, calls)
+                run.written(key, st)
+                stored += 1
+                print(f"  {date_iso}  {st:16s} [{tzname.split('/')[-1]}{' +' + str(len(st_groups[st]) - 1) + ' zone window(s)' if len(st_groups[st]) > 1 else ''}] "
+                      f"peak {peak:.0f} mph, {len(feats)} band(s)")
+                if not run.dry_run:
+                    time.sleep(float(os.environ.get("STATE_PAUSE", "0.4")))
+            except Exception as e:
+                run.error(key, st, f"{type(e).__name__}: {e}")
+    _SLICE_CACHE.clear()
+    d = run.day(key)
+    if not run.dry_run and d["written"]:
+        check_obs_only(run, key, d["written"])
+    run.set_received(key, "states_ok", len(d["written"]) + len([s for s in d["empty"] if s in PERMITTED_STATES]))
+    if stored == 0 and not d["failed"]:
+        print(f"{date_iso}: no >= {POINT_FLOOR} mph wind on land in selected state(s).")
+    return stored
+
+
 # Owner-approved 2026-10-07: wind_swath_begin_v2 also clears obs_only when the
 # grid lands (a deferred day can be rescued at 12:00Z before its grid exists).
 # legacy keeps v1 so test replays reproduce the stored night-one calls.
@@ -732,6 +912,12 @@ def main(run):
     heal_from = fg._one_date(heal_from) if heal_from else None
     run.meta.update({"boundary_md5": BOUNDARY_MD5, "hours_policy": policy, "hours_step": step,
                      "numpy": np.__version__, "pygrib": pygrib.__version__})
+    conv = tzwin.convention()
+    flags = tzwin.test_flags(run.dry_run) if conv == "v4" else None
+    run.meta["day_convention"] = conv
+    if conv == "v4":
+        run.meta.update({"tzwin_md5": tzwin.module_md5(), "zone_map_md5": tzwin.zone_map("urma").md5,
+                         "v4_flags": flags})
 
     dates = []
     if explicit is not None:
@@ -779,11 +965,14 @@ def main(run):
             print("All recent dates already ingested — nothing to do.")
     states = parse_states()
 
-    print(f"URMA wind ingest: {len(dates)} date(s), {len(states)} state(s), hour step {step}, "
-          f"hours policy {policy}{' [BG_ONLY]' if bg_only else ''}")
+    print(f"URMA wind ingest ({conv}): {len(dates)} date(s), {len(states)} state(s), hour step {step}, "
+          f"hours policy {policy}{' [BG_ONLY]' if bg_only else ''}{f' {flags}' if flags else ''}")
     total = 0
     for d in dates:
-        total += process_date(run, d, states, step, policy, bg_only)
+        if conv == "v4":
+            total += process_date_v4(run, d, states, step, policy, flags, bg_only)
+        else:
+            total += process_date(run, d, states, step, policy, bg_only)
 
     if not run.dry_run and not bg_only:
         try:
