@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
       - run: sudo apt-get update -q && sudo apt-get install -y -q libeccodes-dev
-      - run: pip install numpy scipy pygrib rasterio shapely requests
+      - run: pip install -r requirements.txt
       - env:
           SUPABASE_URL: https://aozjsfjemobuzqrhxcxy.supabase.co
           SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFvempzZmplbW9idXpxcmh4Y3h5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2NzMyODIsImV4cCI6MjEwMDI0OTI4Mn0.gYwwzMcT4VCuTyWHNXlm8viyeGOsv7isfNgegYAmcV8

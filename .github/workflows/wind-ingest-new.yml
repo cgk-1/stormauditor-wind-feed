@@ -10,13 +10,16 @@ on:
   workflow_dispatch:
     inputs:
       date:
-        description: "Date(s) YYYYMMDD, comma-separated. Blank = yesterday."
+        description: "Local date(s): YYYY-MM-DD, YYYYMMDD, START..END or a:b, comma lists (all hours required). Blank = yesterday (+ self-heal; deferred until every URMA hour is published)."
         required: false
       states:
         description: "Comma list of states. Blank = all permitted."
         required: false
       hours_step:
         description: "Hour stride for daily max (1=hourly/best, 3=faster backfill)."
+        required: false
+      dry_run:
+        description: "1 = compute everything, write nothing (payload md5 + row counts in the summary/artifact)."
         required: false
 
 # One run at a time; a second trigger queues behind the first (never cancels it).
@@ -33,7 +36,7 @@ jobs:
       - name: System deps
         run: sudo apt-get update && sudo apt-get install -y libeccodes-dev
       - name: Python deps
-        run: pip install pygrib numpy scipy rasterio shapely requests
+        run: pip install -r requirements.txt
       - name: Run ingester
         env:
           SUPABASE_URL:      https://aozjsfjemobuzqrhxcxy.supabase.co
@@ -42,4 +45,14 @@ jobs:
           INGEST_DATE:       ${{ github.event.inputs.date }}
           STATES:            ${{ github.event.inputs.states }}
           HOURS_STEP:        ${{ github.event.inputs.hours_step }}
+          DRY_RUN:           ${{ github.event.inputs.dry_run }}
+          FEED_OUT_DIR:      feed-out
         run: python wind_ingest.py
+      - name: Upload run record (summary JSON, quarantine records, dry-run payloads)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feed-out-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: feed-out
+          if-no-files-found: ignore
+          retention-days: 30
