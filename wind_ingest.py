@@ -60,10 +60,22 @@ DAY_CONVENTION=v4 (Archive Phase 5 Stage 3, 2026-10-07; default v3 = unchanged):
   national backgrounds (hz_station_bg ANL, hz_bg_coarse ANL) are NOT changed
   (plan T6, kept for Phase 5). Test flags (DRY_RUN only): V4_ZONES=state.
 
+STAGE 4 (owner-approved 2026-10-07): the workflow passes DAY_CONVENTION=v4 on
+every schedule/dispatch unless a dispatch sets day_convention=v3 (the code's
+own default stays v3, so local runs without the variable are unchanged). The
+HOURS_POLICY defer/strict behaviour and wind_swath_begin_v2 are unchanged.
+Explicit-date runs end each fully successful day with the clear-step
+(clearstep.py, RPC hz_day_clear_states_v2): states of the run's scope that were
+not re-supplied lose their stale feed rows (wind_days with obs_only=false,
+wind_polygons, wind_points); obs_only rescue rows are never deleted, and a
+cleared state with LSR wind evidence gets the wind_obs_rescue row it would
+have had. Not with BG_ONLY or HOURS_POLICY=legacy. CLEAR_STEP=0 turns it off;
+DRY_RUN only reports what it would clear.
+
 Env (GitHub repo secrets): SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
 Optional: DATE / INGEST_DATE, STATES, HOURS_STEP, HOURS_POLICY, BG_ONLY,
           HEAL_SHORT_WINDOWS_FROM, URMA_PUBLISH_GRACE_H, DAY_CONVENTION (v3|v4),
-          V4_ZONES / V4_DST (dry-run test flags),
+          V4_ZONES / V4_DST (dry-run test flags), CLEAR_STEP (1/0),
           DRY_RUN, FEED_OUT_DIR, STATE_PAUSE, HZ_STATIONS_FILE (offline station
           list for dry runs without the secret)
 Deps: requirements.txt (exact pins)
@@ -79,6 +91,7 @@ from shapely.geometry import shape, mapping, Point, MultiPolygon, Polygon
 from shapely.prepared import prep
 from shapely.ops import unary_union
 
+import clearstep
 import feedguard as fg
 import tzwin
 
@@ -975,6 +988,15 @@ def main(run):
             total += process_date_v4(run, d, states, step, policy, flags, bg_only)
         else:
             total += process_date(run, d, states, step, policy, bg_only)
+        # Stage 4 clear-step (explicit-date runs only, fully successful days only):
+        # states of this run's scope that were NOT re-supplied lose their stale
+        # wind_days (feed rows, never obs_only rescue rows) / wind_polygons /
+        # wind_points rows (clearstep.py). Not with BG_ONLY (no state is written
+        # there) and not with HOURS_POLICY=legacy (test replays of short windows).
+        if not bg_only and policy != "legacy":
+            key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+            clearstep.after_day(run, key, "ANL", states, run.day(key)["written"],
+                                explicit=explicit is not None)
 
     if not run.dry_run and not bg_only:
         try:
