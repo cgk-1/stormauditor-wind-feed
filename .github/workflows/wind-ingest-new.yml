@@ -19,9 +19,11 @@ on:
         description: "Hour stride for daily max (1=hourly/best, 3=faster backfill)."
         required: false
 
+# One run at a time; a second trigger queues behind the first (never cancels it).
+concurrency: {group: wind-ingest, cancel-in-progress: false}
 jobs:
   ingest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
